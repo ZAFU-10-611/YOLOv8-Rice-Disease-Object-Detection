@@ -1,0 +1,1 @@
+# YOLOv8-Rice-Disease-Object-Detection
