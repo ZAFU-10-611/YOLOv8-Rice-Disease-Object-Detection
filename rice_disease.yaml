@@ -1,0 +1,7 @@
+path: D:/dataset
+train: D:/dataset/images/train
+val: D:/dataset/images/val
+
+nc: 5
+names: ["insect","leaf scald","rice blast","rice tungro","rice leaffolder"]
+
