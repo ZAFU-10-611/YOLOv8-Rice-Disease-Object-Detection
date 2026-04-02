@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
 """
 功能：
 1. 运行程序后弹出文件夹选择窗口
 2. 批量处理该文件夹下所有 TXT 文件
 3. 若每行第一列为 0，则修改为 1
 4. 其余内容保持不变
-5. 直接覆盖原 TXT 文件
+5. 直接覆盖原 TXT 文件.
 """
 
 import os
@@ -14,7 +13,7 @@ from tkinter import filedialog, messagebox
 
 
 def modify_txt(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, encoding="utf-8") as f:
         lines = f.readlines()
 
     new_lines = []
@@ -46,11 +45,7 @@ def modify_txt(file_path):
 
 
 def batch_process(folder_path):
-    txt_files = [
-        os.path.join(folder_path, f)
-        for f in os.listdir(folder_path)
-        if f.lower().endswith(".txt")
-    ]
+    txt_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(".txt")]
 
     if not txt_files:
         messagebox.showinfo("提示", "该文件夹下未找到 TXT 文件。")
@@ -61,10 +56,7 @@ def batch_process(folder_path):
         modify_txt(txt_file)
         count += 1
 
-    messagebox.showinfo(
-        "完成",
-        f"批量处理完成！\n\n处理文件数：{count}"
-    )
+    messagebox.showinfo("完成", f"批量处理完成！\n\n处理文件数：{count}")
 
 
 def main():
@@ -73,9 +65,7 @@ def main():
     root.withdraw()
 
     # 选择文件夹
-    folder_path = filedialog.askdirectory(
-        title="请选择包含 TXT 文件的文件夹"
-    )
+    folder_path = filedialog.askdirectory(title="请选择包含 TXT 文件的文件夹")
 
     if not folder_path:
         messagebox.showinfo("提示", "未选择文件夹，程序已退出。")
@@ -90,10 +80,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-import os
-import tkinter as tk
-from tkinter import filedialog
-
 
 # 打开文件夹选择对话框
 def select_folder():
@@ -106,7 +92,7 @@ def select_folder():
 # 检查文件是否为空
 def check_empty_txt_files(folder_path):
     # 获取文件夹下所有的TXT文件
-    txt_files = [f for f in os.listdir(folder_path) if f.endswith('.txt')]
+    txt_files = [f for f in os.listdir(folder_path) if f.endswith(".txt")]
 
     # 遍历所有TXT文件
     for txt_file in txt_files:
