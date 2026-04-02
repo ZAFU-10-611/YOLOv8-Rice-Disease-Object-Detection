@@ -1,4 +1,5 @@
 <<<<<<< HEAD
+
 <div align="center">
   <p>
     <a href="https://platform.ultralytics.com/ultralytics/yolo26" target="_blank">
