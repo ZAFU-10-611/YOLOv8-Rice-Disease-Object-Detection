@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
   <p>
     <a href="https://platform.ultralytics.com/ultralytics/yolo26" target="_blank">
@@ -275,3 +276,6 @@ For bug reports and feature requests related to Ultralytics software, please vis
   <img src="https://github.com/ultralytics/assets/raw/main/social/logo-transparent.png" width="3%" alt="space">
   <a href="https://discord.com/invite/ultralytics"><img src="https://github.com/ultralytics/assets/raw/main/social/logo-social-discord.png" width="3%" alt="Ultralytics Discord"></a>
 </div>
+=======
+# YOLOv8-Rice-Disease-Object-Detection
+>>>>>>> cbbb271b1b866beb2f7bb20b6eb7aab0c77c85e7
