@@ -3,4 +3,4 @@ train: D:/dataset2/images/train
 val: D:/dataset2/images/val
 
 nc: 4
-names: ["insect","leaf scald","rice blast","rice leaffolder"]
+names: ["insect", "leaf scald", "rice blast", "rice leaffolder"]
