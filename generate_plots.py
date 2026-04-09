@@ -293,9 +293,9 @@ def main():
     
     # 查找results.csv
     possible_paths = [
-        "E:/yolov8/runs/detect/runs/train/exp5/results.csv",
-        "runs/detect/runs/train/exp5/results.csv",
-        "runs/train/exp5/results.csv",
+        "E:/yolov8/runs/detect/runs/train/exp10/results.csv",
+        "runs/detect/runs/train/exp10/results.csv",
+        "runs/train/exp10/results.csv",
     ]
     
     results_path = None

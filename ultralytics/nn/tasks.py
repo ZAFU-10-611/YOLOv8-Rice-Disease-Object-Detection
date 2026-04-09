@@ -18,6 +18,7 @@ from ultralytics.nn.modules import (
     C2PSA,
     C3,
     C3TR,
+    CBAM,
     ELAN1,
     OBB,
     OBB26,
@@ -1576,6 +1577,7 @@ def parse_model(d, ch, verbose=True):
             SPPF,
             C2fPSA,
             C2PSA,
+            CBAM,
             DWConv,
             Focus,
             BottleneckCSP,
@@ -1641,21 +1643,30 @@ def parse_model(d, ch, verbose=True):
             if m is C2fAttn:  # set 1) embed channels and 2) num heads
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
-
-            args = [c1, c2, *args[1:]]
-            if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
-                n = 1
-            if m is C3k2:  # for M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
-            if m is A2C2f:
-                legacy = False
-                if scale in "lx":  # for L/X sizes
-                    args.extend((True, 1.2))
-            if m is C2fCIB:
-                legacy = False
+            # ========== 修正 CBAM 解析（关键修改）==========
+            if m is CBAM:
+                # CBAM 不改变通道数，c2 = c1
+                c2 = c1
+                # YAML 中 args 应该只包含 kernel_size，例如 [7]
+                # 这里确保 args 的第一个参数（索引0）是 kernel_size
+                kernel_size = args[0] if args else 7
+                args = [c1, kernel_size]  # 重新构造参数列表
+            # ============================================
+            else:
+                args = [c1, c2, *args[1:]]
+                if m in repeat_modules:
+                    args.insert(2, n)  # number of repeats
+                    n = 1
+                if m is C3k2:  # for M/L/X sizes
+                    legacy = False
+                    if scale in "mlx":
+                        args[3] = True
+                if m is A2C2f:
+                    legacy = False
+                    if scale in "lx":  # for L/X sizes
+                        args.extend((True, 1.2))
+                if m is C2fCIB:
+                    legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

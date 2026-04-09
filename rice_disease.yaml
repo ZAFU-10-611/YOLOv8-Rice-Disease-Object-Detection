@@ -2,5 +2,5 @@ path: D:/dataset2
 train: D:/dataset2/images/train
 val: D:/dataset2/images/val
 
-nc: 4
-names: ["insect","leaf scald","rice blast","rice leaffolder"]
+nc: 5
+names: ["insect","leaf scald","rice blast","rice leaffolder","rice stripes"]

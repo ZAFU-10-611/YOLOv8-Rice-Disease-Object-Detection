@@ -1,6 +1,7 @@
 import argparse
 from ultralytics import YOLO
 import torch
+import torch.nn as nn
 import os
 import sys
 import warnings
@@ -23,6 +24,13 @@ def parse_opt():
     parser.add_argument('--project', default='runs/train')
     parser.add_argument('--name', default='exp')
     parser.add_argument('--exist-ok', action='store_true')
+
+    # ⭐ 注意力机制相关参数（方案A：动态插入CBAM）
+    parser.add_argument('--attention', default=None,
+                        choices=['cbam', None],
+                        help='注意力机制: cbam (动态插入CBAM模块) 或 None')
+    parser.add_argument('--use-attention-yaml', action='store_true',
+                        help='(已弃用) 使用注意力机制YAML配置文件')
 
     # 高学习率训练相关参数
     parser.add_argument('--high-lr', action='store_true', help='启用高学习率训练模式')
@@ -67,131 +75,181 @@ def parse_opt():
     return parser.parse_args()
 
 
+# ==================== 方案A核心：动态插入 CBAM ====================
+def inject_cbam_into_yolo11(model):
+    """
+    动态将 CBAM 模块插入 YOLOv11 backbone 的 P3 (256ch) 和 P4 (512ch) 输出位置。
+    只插入两个 CBAM：第一个 256 通道 C3k2 后，第一个 512 通道 C3k2 后。
+    """
+    from ultralytics.nn.modules import CBAM
+    import torch.nn as nn
+
+    # 获取模型序列
+    if hasattr(model, 'model') and hasattr(model.model, 'model'):
+        seq = model.model.model
+    else:
+        seq = model.model
+
+    # 转换为列表以便插入
+    layers = list(seq.children())
+    insert_info = []  # 存放 (索引, 通道数, 名称)
+
+    found_256 = False
+    found_512 = False
+
+    for idx, m in enumerate(layers):
+        if m.__class__.__name__ == 'C3k2':
+            out_ch = None
+            # 获取输出通道数
+            if hasattr(m, 'cv3') and hasattr(m.cv3, 'conv'):
+                out_ch = m.cv3.conv.out_channels
+            elif hasattr(m, 'cv2') and hasattr(m.cv2, 'conv'):
+                out_ch = m.cv2.conv.out_channels
+
+            if out_ch == 256 and not found_256:
+                insert_info.append((idx, 256, 'P3'))
+                found_256 = True
+                print(f"✅ 定位 P3 插入点: 层 {idx} (输出通道 256)")
+            elif out_ch == 512 and not found_512:
+                insert_info.append((idx, 512, 'P4'))
+                found_512 = True
+                print(f"✅ 定位 P4 插入点: 层 {idx} (输出通道 512)")
+
+            if found_256 and found_512:
+                break
+
+    if not insert_info:
+        print("⚠️ 未找到合适的 C3k2 层，CBAM 插入失败。")
+        return model
+
+    # 从后向前插入，避免索引错乱
+    for idx, ch, name in sorted(insert_info, key=lambda x: x[0], reverse=True):
+        cbam = CBAM(ch, kernel_size=7)
+        layers.insert(idx + 1, cbam)
+        print(f"✅ 在层 {idx} ({name}) 后插入 CBAM (kernel_size=7)")
+
+    # 重新构建 Sequential
+    new_seq = nn.Sequential(*layers)
+
+    # 替换回原模型
+    if hasattr(model, 'model') and hasattr(model.model, 'model'):
+        model.model.model = new_seq
+    else:
+        model.model = new_seq
+
+    # 尝试重置内部索引（非必须，但建议）
+    try:
+        # 对于 YOLO 封装，有时需要清理缓存
+        if hasattr(model.model, '_modules'):
+            # 避免 None 比较错误
+            if model.model._modules is not None:
+                model.model._modules.clear()
+        if hasattr(model.model, '_reset_sequential'):
+            model.model._reset_sequential()
+    except Exception as e:
+        # 忽略重置时的非关键错误
+        print(f"⚠️ 模型状态重置时出现非致命警告: {e}")
+
+    print("✅ CBAM 动态插入完成，模型结构已更新。")
+    return model
+
+def auto_select_attention_model(opt):
+    """
+    适配方案A：如果用户指定 --attention cbam，则后续动态插入 CBAM。
+    """
+    if opt.attention is None:
+        return opt
+
+    print("\n" + "="*60)
+    print("🔄 注意力机制配置 (动态插入 CBAM)")
+    print("="*60)
+
+    # 检查模型是否为 .pt 预训练权重（推荐）
+    if not opt.model.endswith('.pt'):
+        print("⚠️ 警告：建议使用官方 .pt 权重（如 yolo11l.pt）以正确加载预训练参数。")
+    print(f"✅ 将在加载模型后动态插入 CBAM 模块。")
+    opt.use_attention_yaml = False  # 不再使用 YAML 模式
+    return opt
+
+
+def setup_attention_mechanism(opt):
+    """保留原函数，但不再修改学习率，仅打印信息"""
+    if opt.attention is None:
+        return opt
+
+    print("\n" + "="*60)
+    print("🧠 注意力机制参数微调 (基于数据集大小)")
+    print("="*60)
+
+    dataset_size = get_dataset_size(opt.data)
+    print(f"📊 数据集大小: {dataset_size} 张图像" if dataset_size else "⚠️ 无法检测数据集大小")
+
+    # 对 CBAM 模型适当降低学习率（可选）
+    if dataset_size and dataset_size < 1000:
+        opt.lr0 = min(opt.lr0, 0.001)
+        opt.weight_decay = max(opt.weight_decay, 0.001)
+        print("📉 小数据集：学习率已自动保守化")
+    print("✅ 注意力机制配置完成")
+    return opt
+
+
 def get_dataset_size(data_yaml_path):
-    """
-    检测数据集大小
-    返回训练集图像数量
-    """
+    """检测数据集训练图像数量"""
     try:
         if not os.path.exists(data_yaml_path):
-            print(f"⚠️ 数据文件不存在: {data_yaml_path}")
             return None
-            
         with open(data_yaml_path, 'r', encoding='utf-8') as f:
             data_config = yaml.safe_load(f)
-        
         if 'train' not in data_config:
-            print("⚠️ 数据配置文件中没有 'train' 字段")
             return None
-            
         train_path = data_config['train']
-        
-        # 处理相对路径
         if not os.path.isabs(train_path):
             yaml_dir = os.path.dirname(data_yaml_path)
             train_path = os.path.join(yaml_dir, train_path)
-        
-        # 计算图像数量
         if os.path.isdir(train_path):
-            image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-            image_count = sum(1 for f in os.listdir(train_path) 
-                            if os.path.splitext(f)[1].lower() in image_extensions)
-            return image_count
-        else:
-            print(f"⚠️ 训练路径不是目录: {train_path}")
-            return None
-            
+            exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+            return sum(1 for f in os.listdir(train_path) if os.path.splitext(f)[1].lower() in exts)
     except Exception as e:
-        print(f"❌ 检测数据集大小时出错: {e}")
-        return None
+        print(f"⚠️ 数据集大小检测失败: {e}")
+    return None
 
 
 def setup_high_lr_config(opt):
-    """
-    ⭐ 优化1: 智能学习率配置 - 基于数据集大小和模型大小自动调整
-    
-    问题分析:
-    - 原始lr0=0.01对846张小数据集太高
-    - 导致训练不稳定和后期过拟合
-    - 解决方案: 小数据集使用低学习率+强正则化
-    """
     if opt.high_lr:
         print("\n" + "="*60)
         print("🔧 启用高学习率训练模式 (优化1: 学习率智能配置)")
         print("="*60)
 
-        # 检测数据集大小
         dataset_size = get_dataset_size(opt.data)
         print(f"📊 检测到数据集大小: {dataset_size} 张图像" if dataset_size else "⚠️ 无法检测数据集大小")
 
-        # 根据数据集大小和模型大小调整学习率
-        # 小数据集 (<1000) 需要较低的学习率以防止过拟合
         if dataset_size and dataset_size < 1000:
             print("📉 检测到小数据集模式（<1000张）")
-            
-            if 'yolov8n' in opt.model:
-                opt.lr0 = 0.005     # 小模型+小数据 = 中等学习率
-                opt.lrf = 0.1
-                opt.weight_decay = 0.001
-                opt.freeze = 0      # 不冻结
-            elif 'yolov8s' in opt.model:
-                opt.lr0 = 0.003     # 中模型+小数据 = 低学习率
-                opt.lrf = 0.0001
-                opt.weight_decay = 0.001
-                opt.freeze = 5      # 冻结5层
-            elif 'yolov8m' in opt.model:
-                opt.lr0 = 0.002     # 大模型+小数据 = 更低学习率 ⭐ 针对用户情况
-                opt.lrf = 0.0001
-                opt.weight_decay = 0.001
-                opt.freeze = 10     # 冻结10层 - 关键优化
-            elif 'yolov8l' in opt.model:
-                opt.lr0 = 0.001
-                opt.lrf = 0.0001
-                opt.weight_decay = 0.0015
-                opt.freeze = 15
-            elif 'yolov8x' in opt.model:
-                opt.lr0 = 0.0008
-                opt.lrf = 0.00001
-                opt.weight_decay = 0.002
-                opt.freeze = 20
+            if 'yolov11' in opt.model:
+                opt.lr0 = 0.0012
+                opt.lrf = 1e-6
+                opt.weight_decay = 0.0018
+                opt.freeze = 10
             else:
                 opt.lr0 = 0.002
                 opt.lrf = 0.0001
                 opt.weight_decay = 0.001
-                
-            opt.lr_warmup = 10  # 增加预热轮数至10，更稳定开始
-            opt.patience = 50   # 减少早停耐心至50（防止无效训练）
-            opt.close_mosaic = 20  # 最后20个epoch关闭mosaic
-            
+            opt.lr_warmup = 10
+            opt.patience = 50
+            opt.close_mosaic = 20
         else:
-            # 大数据集和中等数据集（1000-5000张）可使用中等学习率
-            if 'yolov8n' in opt.model:
-                opt.lr0 = 0.01
-                opt.lrf = 0.1
-            elif 'yolov8s' in opt.model:
-                opt.lr0 = 0.008
-                opt.lrf = 0.0001
-            elif 'yolov8m' in opt.model:
-                # 中等数据集+中等模型：更低更稳定的学习率
-                opt.lr0 = 0.002  # ⭐ 进一步降低至0.002以减少后期波动
-                opt.lrf = 0.00005  # 更较缓的衰减
-                opt.weight_decay = 0.001  # 增强正则化到0.001
-                opt.lr_warmup = 15  # 增加预热轮数至15
-            elif 'yolov8l' in opt.model:
-                opt.lr0 = 0.002
-                opt.lrf = 0.00001
-            elif 'yolov8x' in opt.model:
-                opt.lr0 = 0.0015
-                opt.lrf = 0.00001
+            if 'yolov11' in opt.model:
+                opt.lr0 = 0.001
+                opt.lrf = 1e-6
+                opt.weight_decay = 0.0018
+                opt.lr_warmup = 15
+                opt.patience = 45
+                print("   ⭐ YOLOv11L 架构检测，应用专用优化配置")
             else:
                 opt.lr0 = 0.005
                 opt.lrf = 0.0001
-                
-            if 'yolov8m' not in opt.model:
                 opt.weight_decay = 0.0005
                 opt.lr_warmup = 5
-
-        # 启用余弦学习率调度
         opt.cos_lr = True
 
         print(f"✅ 学习率配置完成:")
@@ -201,318 +259,134 @@ def setup_high_lr_config(opt):
         print(f"   - 预热轮数: {opt.lr_warmup}")
         print(f"   - 冻结层数: {opt.freeze if opt.freeze else '无'}")
         print(f"   - 早停耐心: {opt.patience}")
-
     return opt
 
 
 def setup_augmentation(opt):
-    """
-    ⭐ 优化2: 激进数据增强配置 (改进版)
-    
-    根据数据集大小自动调整增强强度：
-    - 小数据集：更强的增强 + 低学习率
-    - 中等数据集：平衡的增强 + 中等学习率  
-    - 大数据集：适度增强 + 高学习率
-    """
     if opt.augment:
         print("\n" + "="*60)
         print("🎨 启用激进数据增强 (优化2: 完整数据增强套件)")
         print("="*60)
-        
-        # 获取数据集大小以调整增强强度
         dataset_size = get_dataset_size(opt.data)
-        
-        # Mosaic增强
         opt.mosaic = 1.0
-        
-        # 根据数据集大小调整MixUp和CutMix
         if dataset_size and dataset_size < 1000:
-            # 小数据集：更强的增强
-            opt.mixup = 0.4  # 提高到40%
-            opt.cutmix = 0.3  # 提高到30%
-            opt.fliplr = 0.5
-            opt.degrees = 25   # 增加旋转角度
+            opt.mixup = 0.4
+            opt.cutmix = 0.3
+            opt.degrees = 25
             opt.translate = 0.3
-            opt.scale = 0.5    # 增加缩放
+            opt.scale = 0.5
             print("   配置: 小数据集 - 强增强")
         else:
-            # 中等/大数据集：平衡的增强
-            opt.mixup = 0.15   # 降低至15%
-            opt.cutmix = 0.15  # 降低至15%
-            opt.fliplr = 0.5
+            opt.mixup = 0.15
+            opt.cutmix = 0.15
             opt.degrees = 15
             opt.translate = 0.2
             opt.scale = 0.3
             print("   配置: 中等/大数据集 - 平衡增强")
-        
-        print("✅ 数据增强配置完成:")
-        print(f"   - Mosaic: {opt.mosaic}")
-        print(f"   - MixUp: {opt.mixup}")
-        print(f"   - CutMix: {opt.cutmix}")
-        print(f"   - 水平翻转: {opt.fliplr}")
-        print(f"   - 旋转范围: ±{opt.degrees}°")
-        print(f"   - 平移比例: {opt.translate}")
-        print(f"   - 缩放比例: {opt.scale}")
-    
+        opt.fliplr = 0.5
+        print("✅ 数据增强配置完成")
     return opt
 
 
 def optimize_for_small_dataset(opt):
-    """
-    ⭐ 优化3: 小数据集智能优化
-    
-    核心思想:
-    - 自动检测数据集大小
-    - 根据数据集大小应用相应优化
-    - 防止过拟合的综合方案
-    """
     print("\n" + "="*60)
     print("🧠 启用小数据集智能优化 (优化3: 自适应参数调整)")
     print("="*60)
-    
     dataset_size = get_dataset_size(opt.data)
-    
     if dataset_size is None:
-        print("⚠️ 无法检测数据集大小，跳过小数据集优化")
+        print("⚠️ 无法检测数据集大小，跳过优化")
         return opt
-    
     print(f"📊 数据集大小: {dataset_size} 张图像")
-    
     if dataset_size < 1000:
         print("📍 触发小数据集优化（<1000张）")
-        
-        # 减少可训练参数 - 冻结早期层
         if opt.freeze is None:
-            freeze_layers = min(int(dataset_size / 100), 20)  # 根据数据量冻结不同数量的层
-            opt.freeze = freeze_layers
-            print(f"   ✓ 冻结前 {opt.freeze} 层以减少参数")
-        
-        # 增强正则化
+            opt.freeze = min(int(dataset_size / 100), 20)
         opt.weight_decay = max(opt.weight_decay, 0.001)
-        print(f"   ✓ 权重衰减设为 {opt.weight_decay}")
-        
-        # 缩短训练周期
         if opt.patience > 50:
             opt.patience = 50
-            print(f"   ✓ 早停耐心设为 {opt.patience}")
-        
-        # 早期关闭mosaic
         opt.close_mosaic = max(20, opt.epochs // 10)
-        print(f"   ✓ 第 {opt.epochs - opt.close_mosaic} 个epoch后关闭mosaic")
-        
-        # 增加预热
         if opt.lr_warmup < 10:
             opt.lr_warmup = 10
-            print(f"   ✓ 预热轮数增至 {opt.lr_warmup}")
-        
-        print("✅ 小数据集优化应用完成")
-        
     elif dataset_size < 5000:
         print("📍 触发中等数据集优化（1000-5000张）")
-        
-        # 中等冻结层数
         if opt.freeze is None:
             opt.freeze = 8
-        print(f"   ✓ 冻结前 {opt.freeze} 层")
-        
-        # 增强正则化
-        opt.weight_decay = max(opt.weight_decay, 0.001)  # ⭐ 增强至0.001
-        print(f"   ✓ 权重衰减设为 {opt.weight_decay}")
-        
-        # 适度调整早停耐心 - 中等耐心值
-        if opt.patience > 60:
-            opt.patience = 60  # ⭐ 降低至60以避免无用训练
-            print(f"   ✓ 早停耐心设为 {opt.patience}")
-        
-        # 提前关闭mosaic - 波动较多时更需要稳定训练
-        opt.close_mosaic = max(50, int(opt.epochs * 0.1))  # ⭐ 最后10%关闭而非15%
-        print(f"   ✓ 第 {opt.epochs - opt.close_mosaic} 个epoch后关闭mosaic")
-        
-        # 增加预热轮数
+        opt.weight_decay = max(opt.weight_decay, 0.001)
+        if opt.patience > 50:
+            opt.patience = 50
+        opt.close_mosaic = max(40, int(opt.epochs * 0.15))
         if opt.lr_warmup < 10:
             opt.lr_warmup = 10
-            print(f"   ✓ 预热轮数增至 {opt.lr_warmup}")
-        
-        print("✅ 中等数据集优化应用完成")
-        
     else:
         print("📍 检测到大数据集（>5000张），使用标准配置")
         if opt.freeze is None:
             opt.freeze = 0
-    
+    print("✅ 小数据集优化应用完成")
     return opt
 
 
-def analyze_overfitting(df, save_dir):
-    """
-    ⭐ 优化4: 过拟合分析与诊断
-    
-    功能:
-    - 计算训练与验证损失差距
-    - 判断过拟合程度
-    - 提供优化建议
-    """
-    print("\n" + "="*60)
-    print("📊 过拟合分析与诊断 (优化4: 训练质量评估)")
-    print("="*60)
-    
+def analyze_four_class_rice_disease(save_dir):
+    """保留原分析函数（略作调整）"""
     try:
-        # 确保有必要的列
-        if 'epoch' not in df.columns:
-            df['epoch'] = range(1, len(df) + 1)
-        
-        # 查找损失列
-        loss_pairs = []
-        for train_col, val_col in [
-            ('train/box_loss', 'val/box_loss'),
-            ('train/cls_loss', 'val/cls_loss'),
-            ('train/dfl_loss', 'val/dfl_loss'),
-            ('train/obj_loss', 'val/obj_loss')
-        ]:
-            if train_col in df.columns and val_col in df.columns:
-                loss_pairs.append((train_col, val_col))
-        
-        if not loss_pairs:
-            print("⚠️ 未找到训练/验证损失列")
+        import pandas as pd
+        results_csv = os.path.join(save_dir, 'results.csv')
+        if not os.path.exists(results_csv):
             return
-        
-        # 计算最后50个epoch的平均过拟合程度
-        last_n_epochs = min(50, len(df))
-        analysis_df = df.tail(last_n_epochs)
-        
-        print(f"\n📈 分析最后 {last_n_epochs} 个epoch的过拟合程度:")
-        
-        max_gap = 0
-        avg_gaps = []
-        
-        for train_col, val_col in loss_pairs:
-            loss_name = train_col.split('/')[-1]
-            
-            # 计算差距
-            gaps = analysis_df[val_col] - analysis_df[train_col]
-            avg_gap = gaps.mean()
-            max_gap_this = gaps.max()
-            
-            avg_gaps.append(avg_gap)
-            max_gap = max(max_gap, max_gap_this)
-            
-            # 判断严重程度
-            if avg_gap > 0.5:
-                severity = "🔴 严重过拟合"
-            elif avg_gap > 0.2:
-                severity = "🟡 轻度过拟合"
-            else:
-                severity = "🟢 过拟合轻微"
-            
-            print(f"   {loss_name:12} - 平均差距: {avg_gap:.4f} {severity}")
-        
-        # 整体评估
-        overall_avg_gap = np.mean(avg_gaps)
-        print(f"\n📋 整体过拟合评估: 平均差距 = {overall_avg_gap:.4f}")
-        
-        # 给出建议
-        print(f"\n💡 优化建议:")
-        if overall_avg_gap > 0.5:
-            print("   ❌ 过拟合严重，建议:")
-            print("      1. 增加数据增强强度")
-            print("      2. 提高权重衰减: --weight-decay 0.002")
-            print("      3. 冻结更多层: --freeze 15")
-            print("      4. 减少批大小: --batch 4")
-            print("      5. 收集更多训练数据")
-        elif overall_avg_gap > 0.2:
-            print("   ⚠️ 存在轻度过拟合，建议:")
-            print("      1. 增加数据增强")
-            print("      2. 微调权重衰减")
-            print("      3. 继续训练但需关注验证集性能")
-        else:
-            print("   ✅ 过拟合程度低，训练质量良好")
-            print("      1. 可继续当前训练策略")
-            print("      2. 若需进一步改进，可微调学习率")
-        
-        # 显示最佳指标
-        if 'metrics/mAP50' in df.columns:
-            best_idx = df['metrics/mAP50'].idxmax()
-            best_mAP50 = df.loc[best_idx, 'metrics/mAP50']
-            best_epoch = df.loc[best_idx, 'epoch']
-            final_mAP50 = df.iloc[-1]['metrics/mAP50']
-            
-            print(f"\n🎯 性能指标:")
-            print(f"   最佳mAP50: {best_mAP50:.4f} (Epoch {int(best_epoch)})")
-            print(f"   最终mAP50: {final_mAP50:.4f}")
-            
-            if final_mAP50 < best_mAP50 * 0.95:
-                print(f"   ⚠️ 最终mAP50较最佳值下降 {((best_mAP50-final_mAP50)/best_mAP50*100):.1f}%")
-                print(f"   💡 建议使用Epoch {int(best_epoch)}的模型: runs/detect/train/expX/weights/best.pt")
-        
-        print("="*60)
-        
+        df = pd.read_csv(results_csv)
+        class_map_cols = [col for col in df.columns if 'mAP50' in col and col != 'metrics/mAP50']
+        if not class_map_cols:
+            return
+        last_n = min(10, len(df))
+        last_epochs = df.tail(last_n)
+        print("\n📊 逐类性能分析（最后{}轮平均）:".format(last_n))
+        for col in class_map_cols:
+            if col in last_epochs.columns:
+                avg = last_epochs[col].mean()
+                name = col.split('(')[-1].replace(')', '').strip()
+                print(f"   {name}: {avg:.4f}")
     except Exception as e:
-        print(f"❌ 过拟合分析出错: {e}")
+        print(f"⚠️ 逐类分析失败: {e}")
 
 
 def get_valid_training_args(opt):
-    """获取YOLOv8支持的有效训练参数"""
     valid_args = [
-        # 基础参数
         'data', 'epochs', 'batch', 'imgsz', 'device', 'workers',
         'project', 'name', 'exist_ok', 'pretrained', 'resume',
-
-        # 优化器相关
         'optimizer', 'lr0', 'lrf', 'momentum', 'weight_decay',
-
-        # 学习率调度
-        'cos_lr', 'lr_warmup', 'warmup_epochs', 'warmup_momentum',
-
-        # 数据增强
+        'cos_lr', 'warmup_epochs', 'warmup_momentum',
         'mosaic', 'mixup', 'cutmix', 'fliplr', 'flipud',
         'degrees', 'translate', 'scale', 'shear', 'perspective',
         'hsv_h', 'hsv_s', 'hsv_v',
-
-        # 训练控制
         'patience', 'close_mosaic', 'freeze',
         'box', 'cls', 'dfl', 'amp', 'overlap_mask',
-
-        # 保存和日志
-        'save', 'save_period', 'save_dir', 'plots', 'verbose',
+        'save', 'save_period', 'plots', 'verbose',
         'conf', 'iou', 'max_det', 'half', 'dnn', 'cache',
-
-        # 其他
-        'seed', 'deterministic', 'single_cls', 'rect', 'overlap_mask',
+        'seed', 'deterministic', 'single_cls', 'rect',
     ]
-
-    # 过滤出有效的参数
     args_dict = vars(opt)
     valid_args_dict = {}
-
-    for arg_name in valid_args:
-        if arg_name in args_dict and args_dict[arg_name] is not None:
-            # 处理特殊参数名转换
-            if arg_name == 'lr_warmup':
-                valid_args_dict['warmup_epochs'] = args_dict[arg_name]
-            elif arg_name == 'save_best':
-                continue
+    for arg in valid_args:
+        if arg in args_dict and args_dict[arg] is not None:
+            if arg == 'lr_warmup':
+                valid_args_dict['warmup_epochs'] = args_dict[arg]
             else:
-                valid_args_dict[arg_name] = args_dict[arg_name]
-
+                valid_args_dict[arg] = args_dict[arg]
     return valid_args_dict
-
-
-
 
 
 def main(opt):
     print("\n" + "="*80)
-    print("🚀 YOLOv8 优化训练脚本启动 - 包含4项关键优化".center(80))
+    print("🚀 YOLOv8 优化训练脚本 - 动态CBAM版".center(80))
     print("="*80)
-    
-    # ⭐ 优化1: 智能学习率配置
+
+    # 注意力机制选择（仅打印）
+    opt = auto_select_attention_model(opt)
+
+    # 参数优化
     opt = setup_high_lr_config(opt)
-
-    # ⭐ 优化2: 数据增强配置
     opt = setup_augmentation(opt)
-
-    # ⭐ 优化3: 小数据集智能优化
     opt = optimize_for_small_dataset(opt)
+    opt = setup_attention_mechanism(opt)
 
     print(f"\n📋 最终训练配置:")
     print(f"  模型: {opt.model}")
@@ -524,23 +398,22 @@ def main(opt):
     print(f"\n📦 加载模型: {opt.model}")
     model = YOLO(opt.model)
 
+    # ⭐ 动态插入 CBAM（如果指定了 --attention cbam）
+    if opt.attention == 'cbam':
+        print("\n" + "="*60)
+        print("🧠 执行动态 CBAM 插入 (方案A)")
+        print("="*60)
+        model = inject_cbam_into_yolo11(model)
+
     train_args = get_valid_training_args(opt)
 
     print(f"\n🎯 开始训练...")
     try:
         results = model.train(**train_args)
         print(f"\n✅ 训练完成!")
-
-        print("\n" + "="*60)
-        print("🎓 优化训练完成 - 总结")
-        print("="*60)
-        print("应用的优化策略:")
-        print("  ✅ 优化1: 智能学习率配置")
-        print("  ✅ 优化2: 激进数据增强")
-        print("  ✅ 优化3: 小数据集自适应")
-        print("  ✅ 优化4: 过拟合诊断")
-        print("="*60)
-
+        # 分析
+        save_dir = results.save_dir if hasattr(results, 'save_dir') else opt.project
+        analyze_four_class_rice_disease(save_dir)
     except Exception as e:
         print(f"❌ 训练过程中出现错误: {e}")
         import traceback
